@@ -1,82 +1,119 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
-from datetime import datetime, timedelta
+from tkinter import ttk, messagebox, simpledialog, filedialog
+from datetime import datetime, timedelta, date
 import os
 import json
 import locale
-import threading
+import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-import logging
+import shutil
+import sys
+import platform
+import csv
 
-POLISH_DAYS_MAPPING = {
-    'Monday': 'poniedziałek',
-    'Tuesday': 'wtorek',
-    'Wednesday': 'środa', 
-    'Thursday': 'czwartek',
-    'Friday': 'piątek',
-    'Saturday': 'sobota',
-    'Sunday': 'niedziela'
-}
+# ==============================================================================
+#  Stałe i Konfiguracja (CONSTANTS)
+# ==============================================================================
+
+class AppConfig:
+    """Przechowuje stałe i konfiguracje aplikacji."""
+    APP_NAME = "Stoper Pro"
+    APP_VERSION = "3.0 Final"
+    
+    # Ścieżki plików zmienione na .csv
+    LOG_FILE = "wynik-stoper.csv"
+    CONFIG_FILE = "config-stoper.json"
+    LOG_BACKUP_FILE = "wynik-stoper.csv.bak"
+    APP_LOG_FILE = "log-stoper.log"
+
+    # Kolory
+    COLOR_GREEN_DARK = "#27AE60"
+    COLOR_GREEN_LIGHT = "#2ECC71"
+    COLOR_BLUE_SEA = "#2E86AB"
+    COLOR_BLUE_ACTION = "#2196F3"
+    COLOR_ORANGE_DARK = "#E67E22"
+    COLOR_ORANGE_LIGHT = "#F39C12"
+    COLOR_RED_DARK = "#E74C3C"
+    COLOR_RED_LIGHT = "#F44336"
+    COLOR_PURPLE_DARK = "#8E44AD"
+    COLOR_PURPLE_VIOLET = "#800080"
+    COLOR_GRAY = "#7F8C8D"
+    COLOR_WHITE = "white"
+    COLOR_BG_DARK = "#2C3E50"
+    COLOR_FG_DARK = "#ECF0F1"
+
+    # Czcionki
+    FONT_DEFAULT = ("Helvetica", 9)
+    FONT_DEFAULT_BOLD = ("Helvetica", 9, "bold")
+    FONT_TIME_LABEL = ("Helvetica", 38, "bold")
+    FONT_SUM_LABEL = ("Helvetica", 10, "bold")
+    FONT_STATUS_INDICATOR = ("Helvetica", 8, "bold")
+
+    # Ustawienia Timera
+    RESET_CONFIRMATION_SECONDS = 600  # 10 minut
+
+# ==============================================================================
+#  Główna Klasa Aplikacji
+# ==============================================================================
 
 class StopwatchApp:
-    """Enhanced stopwatch application with improved architecture and features."""
-    
+    """Ulepszona aplikacja stopera z poprawioną architekturą i funkcjonalnościami."""
+
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Stoper Pro")
-        # Zmieniona wysokość okna (z 620 na około 496, czyli ~20% mniej)
+        self.root.title(AppConfig.APP_NAME)
         self.root.geometry("500x496")
-        
-        # Core state
+
+        # --- Stan Aplikacji (Core State) ---
         self.is_running = False
-        self.counter = 0
-        self.start_time: Optional[datetime] = None
-        self.last_reminder_time: Optional[float] = None
-        self.reminder_window: Optional[tk.Toplevel] = None
+        self.counter: float = 0.0
+        self.start_timestamp: Optional[datetime] = None
+        self.elapsed_time_before_pause: float = 0.0
         self.current_task: str = ""
+        self.last_logged_minute_mark: int = 0
         
-        # Setup logging
+        # --- Stan Okien Pomocniczych ---
+        self.reminder_window: Optional[tk.Toplevel] = None
+        self.last_reminder_time: Optional[float] = None
+        self.status_popup: Optional[tk.Toplevel] = None
+
+        # --- Inicjalizacja ---
         self.setup_logging()
-        
-        # Load configuration with validation
         self.config = self.load_config()
         self.daily_goal = self.config.get('daily_goal', 180)
-        
-        # Setup locale
+
         self.setup_locale()
-        
-        # Initialize UI and functionality
+        self.setup_styles()
         self.setup_ui()
         self.setup_keybindings()
         self.setup_menu()
+        self.create_status_indicator()
         
-        # Start background tasks
+        # --- Uruchomienie pętli i procesów ---
         self.update_display()
         self.reminder_check()
+        self.apply_config_changes()
         
-        # Handle window closing
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
         self.center_window()
 
     def center_window(self) -> None:
-        """Center the main application window on the screen."""
-        self.root.update_idletasks()  # Ensure window dimensions are updated
+        self.root.update_idletasks()
         width = self.root.winfo_width()
         height = self.root.winfo_height()
-        
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        
         x = (screen_width // 2) - (width // 2)
         y = (screen_height // 2) - (height // 2)
-        
         self.root.geometry(f'+{x}+{y}')
 
+    # ==========================================================================
+    #  Konfiguracja i Ustawienia (Setup Methods)
+    # ==========================================================================
+
     def setup_logging(self) -> None:
-        """Setup logging configuration."""
-        log_path = self.get_app_path() / "app.log"
+        log_path = self.get_app_path() / AppConfig.APP_LOG_FILE
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -88,157 +125,110 @@ class StopwatchApp:
         self.logger = logging.getLogger(__name__)
 
     def get_app_path(self) -> Path:
-        """Get application directory path."""
-        return Path(__file__).parent
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).parent
+        else:
+            return Path(__file__).parent
 
     def setup_locale(self) -> None:
-        """Setup Polish locale with fallbacks and proper encoding."""
-        import sys
-        import platform
-        
-        # Ustaw kodowanie dla Windows
+        locales_to_try = ['pl_PL.UTF-8', 'pl_PL.utf8', 'pl_PL', 'pl']
         if platform.system() == "Windows":
-            try:
-                # Dla Windows, ustaw kodowanie konsoli
-                sys.stdout.reconfigure(encoding='utf-8')
-                sys.stderr.reconfigure(encoding='utf-8')
-            except:
-                pass
-        
-        # Lista locale do wypróbowania w zależności od systemu
-        if platform.system() == "Windows":
-            locales_to_try = ['Polish_Poland.1250', 'Polish_Poland.utf8', 'pl_PL.UTF-8', 'pl_PL', 'pl']
-        else:
-            locales_to_try = ['pl_PL.UTF-8', 'pl_PL.utf8', 'pl_PL', 'pl', 'C.UTF-8']
-        
-        locale_set = False
+            locales_to_try.insert(0, 'Polish_Poland.1250')
         for loc in locales_to_try:
             try:
                 locale.setlocale(locale.LC_ALL, loc)
-                self.logger.info(f"Locale set to: {loc}")
-                locale_set = True
-                break
+                self.logger.info(f"Locale ustawione na: {loc}")
+                return
             except locale.Error:
                 continue
-        
-        if not locale_set:
-            self.logger.warning("Could not set Polish locale, using default")
-            self.use_custom_day_names = True
-        else:
-            self.use_custom_day_names = False
+        self.logger.warning("Nie udało się ustawić polskiego locale.")
 
     def get_polish_day_name(self, date_obj: datetime.date) -> str:
-        """Get Polish day name with proper encoding."""
-        polish_days = {
-            0: 'poniedziałek',
-            1: 'wtorek', 
-            2: 'środa',
-            3: 'czwartek',
-            4: 'piątek',
-            5: 'sobota',
-            6: 'niedziela'
-        }
-        
-        if hasattr(self, 'use_custom_day_names') and self.use_custom_day_names:
-            return polish_days.get(date_obj.weekday(), 'nieznany')
-        else:
-            try:
-                # Spróbuj użyć locale
-                day_name = date_obj.strftime('%A')
-                # Sprawdź czy nazwa zawiera dziwne znaki
-                if 'Ĺ' in day_name or '‚' in day_name:
-                    return polish_days.get(date_obj.weekday(), 'nieznany')
-                return day_name
-            except:
-                return polish_days.get(date_obj.weekday(), 'nieznany')
-
-    def update_time_color(self) -> None:
-        """Dynamicznie zmienia kolor czasu w zależności od stanu."""
-        if self.is_running:
-            # Gdy stoper działa - ciemnozielony
-            color = "#27AE60"
-        elif self.counter > 0:
-            # Gdy zatrzymany ale ma czas - pomarańczowy
-            color = "#E67E22"
-        else:
-            # Gdy zresetowany - ciemnoniebieski
-            color = "#2E86AB"
-        
-        self.time_label.config(fg=color)    
-
-    def load_config(self) -> Dict:
-        """Load configuration with comprehensive validation."""
-        config_path = self.get_app_path() / "config.json"
-        default_config = {
-            'daily_goal': 180,
-            'reminder_interval': 120,
-            'reminder_duration': 15000,
-            'auto_save': True,
-            'sound_enabled': False,
-            'window_always_on_top': False,
-            'theme': 'default'
-        }
-        
+        polish_days = ['poniedziałek', 'wtorek', 'środa', 'czwartek', 'piątek', 'sobota', 'niedziela']
         try:
-            if config_path.exists():
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
+            day_name = date_obj.strftime('%A').lower()
+            english_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            if day_name in english_days:
+                 return polish_days[date_obj.weekday()]
+            return day_name
+        except Exception:
+            return polish_days[date_obj.weekday()]
             
-                # Validate and merge with defaults
-                validated_config = self.validate_config(config, default_config)
-                return validated_config
-            else:
-                self.save_config(default_config)
-                return default_config
-                
-        except (json.JSONDecodeError, IOError) as e:
-            self.logger.error(f"Configuration loading error: {e}")
-            messagebox.showerror("Błąd", f"Błąd ładowania konfiguracji: {e}\nUżywam ustawień domyślnych.")
-            return default_config
+    def setup_styles(self) -> None:
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
 
-    def validate_config(self, config: Dict, default_config: Dict) -> Dict:
-        """Validate configuration values."""
-        validated = default_config.copy()
-        
-        for key, default_value in default_config.items():
-            if key in config:
-                value = config[key]
-                if key in ['daily_goal', 'reminder_interval', 'reminder_duration']:
-                    if isinstance(value, int) and value > 0:
-                        validated[key] = value
-                    else:
-                        self.logger.warning(f"Invalid value for {key}: {value}, using default")
-                elif key in ['auto_save', 'sound_enabled', 'window_always_on_top']:
-                    validated[key] = bool(value)
-                elif key == 'theme' and isinstance(value, str):
-                    validated[key] = value
-                else:
-                    validated[key] = value
-        
-        return validated
+        btn_padding = 4
+        self.style.configure("Start.TButton", foreground=AppConfig.COLOR_WHITE, background=AppConfig.COLOR_GREEN_DARK, font=AppConfig.FONT_DEFAULT_BOLD, padding=btn_padding)
+        self.style.map("Start.TButton", background=[('active', AppConfig.COLOR_GREEN_LIGHT)])
+        self.style.configure("Pause.TButton", foreground=AppConfig.COLOR_WHITE, background=AppConfig.COLOR_ORANGE_LIGHT, font=AppConfig.FONT_DEFAULT_BOLD, padding=btn_padding)
+        self.style.map("Pause.TButton", background=[('active', AppConfig.COLOR_ORANGE_DARK)])
+        self.style.configure("Reset.TButton", foreground=AppConfig.COLOR_WHITE, background=AppConfig.COLOR_RED_LIGHT, font=AppConfig.FONT_DEFAULT_BOLD, padding=btn_padding)
+        self.style.map("Reset.TButton", background=[('active', AppConfig.COLOR_RED_DARK)])
+        self.style.configure("Save.TButton", foreground=AppConfig.COLOR_WHITE, background=AppConfig.COLOR_BLUE_ACTION, font=AppConfig.FONT_DEFAULT_BOLD, padding=btn_padding)
+        self.style.map("Save.TButton", background=[('active', '#4DABF5')])
 
-    def save_config(self, config: Optional[Dict] = None) -> bool:
-        """Save configuration with error handling."""
-        if config is None:
-            config = self.config
-        
-        config_path = self.get_app_path() / "config.json"
-        try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-            self.logger.info("Configuration saved successfully")
-            return True
-        except IOError as e:
-            self.logger.error(f"Failed to save configuration: {e}")
-            messagebox.showerror("Błąd", f"Nie można zapisać konfiguracji: {e}")
-            return False
+    def setup_ui(self) -> None:
+        main_frame = ttk.Frame(self.root, padding="5")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+
+        self.time_label = tk.Label(main_frame, text="00:00:00", font=AppConfig.FONT_TIME_LABEL, fg=AppConfig.COLOR_BLUE_SEA)
+        self.time_label.grid(row=0, column=0, pady=10, sticky=tk.EW)
+
+        task_frame = ttk.LabelFrame(main_frame, text="Zadanie", padding="5")
+        task_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        task_frame.columnconfigure(0, weight=1)
+        self.task_var = tk.StringVar()
+        self.task_entry = ttk.Entry(task_frame, textvariable=self.task_var, font=AppConfig.FONT_DEFAULT)
+        self.task_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=5)
+        self.task_entry.bind('<Return>', lambda e: self.start())
+
+        controls_frame = ttk.LabelFrame(main_frame, text="Kontrola", padding="5")
+        controls_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
+        controls_frame.columnconfigure((0, 1, 2, 3), weight=1)
+
+        self.start_button = ttk.Button(controls_frame, text="Start", command=self.start, style="Start.TButton")
+        self.start_button.grid(row=0, column=0, padx=5, sticky=tk.EW)
+        self.pause_button = ttk.Button(controls_frame, text="Pauza", command=self.stop, style="Pause.TButton", state="disabled")
+        self.pause_button.grid(row=0, column=1, padx=5, sticky=tk.EW)
+        self.reset_button = ttk.Button(controls_frame, text="Reset", command=self.reset, style="Reset.TButton")
+        self.reset_button.grid(row=0, column=2, padx=5, sticky=tk.EW)
+        self.add_button = ttk.Button(controls_frame, text="Zapisz", command=self.add_to_log, style="Save.TButton")
+        self.add_button.grid(row=0, column=3, padx=5, sticky=tk.EW)
+
+        adjust_frame = ttk.LabelFrame(main_frame, text="Korekta czasu", padding="5")
+        adjust_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+        adjust_frame.columnconfigure((0, 1, 2, 3), weight=1)
+        ttk.Button(adjust_frame, text="+5 min", command=lambda: self.adjust_time(300)).grid(row=0, column=0, padx=2, sticky=tk.EW)
+        ttk.Button(adjust_frame, text="+1 min", command=lambda: self.adjust_time(60)).grid(row=0, column=1, padx=2, sticky=tk.EW)
+        ttk.Button(adjust_frame, text="-1 min", command=lambda: self.adjust_time(-60)).grid(row=0, column=2, padx=2, sticky=tk.EW)
+        ttk.Button(adjust_frame, text="-5 min", command=lambda: self.adjust_time(-300)).grid(row=0, column=3, padx=2, sticky=tk.EW)
+
+        info_frame = ttk.LabelFrame(main_frame, text="Informacje", padding="5")
+        info_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5)
+        info_frame.columnconfigure(0, weight=1)
+        self.start_time_label = ttk.Label(info_frame, text="Czas startu: --")
+        self.start_time_label.grid(row=0, column=0, sticky=tk.W, pady=1)
+        self.progress_label = ttk.Label(info_frame, text="Postęp dnia")
+        self.progress_label.grid(row=1, column=0, sticky=tk.W)
+        self.progress_bar = ttk.Progressbar(info_frame, orient="horizontal", mode="determinate")
+        self.progress_bar.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=1)
+        self.sum_label = ttk.Label(info_frame, text="Suma: 0 min (0.00%)", font=AppConfig.FONT_SUM_LABEL)
+        self.sum_label.grid(row=3, column=0, sticky=tk.W, pady=1)
+
+        quick_frame = ttk.LabelFrame(main_frame, text="Szybkie akcje", padding="5")
+        quick_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=5)
+        quick_frame.columnconfigure((0, 1), weight=1)
+        ttk.Button(quick_frame, text="Historia", command=self.show_history).grid(row=0, column=0, padx=5, sticky=tk.EW)
+        ttk.Button(quick_frame, text="Statystyki", command=self.show_statistics).grid(row=0, column=1, padx=5, sticky=tk.EW)
 
     def setup_menu(self) -> None:
-        """Setup application menu."""
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
         
-        # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Plik", menu=file_menu)
         file_menu.add_command(label="Eksportuj dane...", command=self.export_data)
@@ -246,124 +236,18 @@ class StopwatchApp:
         file_menu.add_separator()
         file_menu.add_command(label="Wyjście", command=self.on_closing)
         
-        # Tools menu
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Narzędzia", menu=tools_menu)
-        tools_menu.add_command(label="Konfiguracja", command=self.show_config)
-        tools_menu.add_command(label="Historia", command=self.show_history)
-        tools_menu.add_command(label="Statystyki", command=self.show_statistics)
+        tools_menu.add_command(label="Konfiguracja", command=self.show_config, accelerator="Ctrl+,")
+        tools_menu.add_command(label="Historia", command=self.show_history, accelerator="Ctrl+H")
+        tools_menu.add_command(label="Statystyki", command=self.show_statistics, accelerator="Ctrl+T")
         
-        # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Pomoc", menu=help_menu)
-        help_menu.add_command(label="Skróty klawiszowe", command=self.show_shortcuts)
+        help_menu.add_command(label="Skróty klawiszowe", command=self.show_shortcuts, accelerator="F1")
         help_menu.add_command(label="O aplikacji", command=self.show_about)
 
-    def setup_ui(self) -> None:
-        """Create enhanced user interface."""
-        # Main frame with padding
-        main_frame = ttk.Frame(self.root, padding="5") # Zmniejszone padding 
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)
-        
-        # Time display with better styling
-        self.time_label = tk.Label(
-            main_frame, 
-            text="00:00:00", 
-            font=("Helvetica", 38, "bold"), # Zmniejszony rozmiar czcionki (z 48 na 38) 
-            fg="#2E86AB",  # NOWY KOLOR - niebieski morski
-            bg=self.root.cget('bg')
-        )
-        self.time_label.grid(row=0, column=0, pady=10, sticky=tk.EW) # Zmniejszone pady (z 20 na 10) 
-
-        task_frame = ttk.LabelFrame(main_frame, text="Zadanie", padding="5") # Zmniejszone padding 
-        task_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5) # Zmniejszone pady (z 10 na 5) 
-        task_frame.columnconfigure(0, weight=1)
-        
-        self.task_var = tk.StringVar(value=self.current_task)
-        self.task_entry = ttk.Entry(task_frame, textvariable=self.task_var, font=("Helvetica", 9)) # Zmniejszony rozmiar czcionki (z 11 na 9) 
-        self.task_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=5)
-        self.task_entry.bind('<Return>', lambda e: self.start())
-
-        # Control buttons frame
-        controls_frame = ttk.LabelFrame(main_frame, text="Kontrola", padding="5") # Zmniejszone padding 
-        controls_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5) # Zmniejszone pady (z 10 na 5) 
-        controls_frame.columnconfigure((0, 1, 2, 3), weight=1)
-
-        # Main control buttons with colors
-        self.start_button = tk.Button(controls_frame, text="Start", command=self.start, bg="#27AE60", fg="white", font=("Helvetica", 9, "bold"), activebackground="#2ECC71", pady=4) # Zmniejszony rozmiar czcionki (z 10 na 9), pady (z 8 na 4) 
-        self.start_button.grid(row=0, column=0, padx=5, sticky=tk.EW)
-
-        self.pause_button = tk.Button(controls_frame, text="Pauza", command=self.stop, bg="#F39C12", fg="white", font=("Helvetica", 9, "bold"), activebackground="#E67E22", pady=4) # Zmniejszony rozmiar czcionki (z 10 na 9), pady (z 8 na 4) 
-        self.pause_button.grid(row=0, column=1, padx=5, sticky=tk.EW)
-
-        self.reset_button = tk.Button(controls_frame, text="Reset", command=self.reset, bg="#F44336", fg="white", font=("Helvetica", 9, "bold"), pady=4) # Zmniejszony rozmiar czcionki (z 10 na 9), pady (z 8 na 4) 
-        self.reset_button.grid(row=0, column=2, padx=5, sticky=tk.EW)
-
-        self.add_button = tk.Button(controls_frame, text="Zapisz", command=self.add_to_log, bg="#2196F3", fg="white", font=("Helvetica", 9, "bold"), pady=4) # Zmniejszony rozmiar czcionki (z 10 na 9), pady (z 8 na 4) 
-        self.add_button.grid(row=0, column=3, padx=5, sticky=tk.EW)
-
-        # Time adjustment frame
-        adjust_frame = ttk.LabelFrame(main_frame, text="Korekta czasu", padding="5") # Zmniejszone padding 
-        adjust_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5) # Zmniejszone pady (z 10 na 5) 
-        adjust_frame.columnconfigure((0, 1, 2, 3), weight=1)
-
-        # Time adjustment buttons
-        ttk.Button(adjust_frame, text="+5 min", command=lambda: self.adjust_time(30000)).grid(row=0, column=0, padx=2, sticky=tk.EW)
-        ttk.Button(adjust_frame, text="+1 min", command=lambda: self.adjust_time(6000)).grid(row=0, column=1, padx=2, sticky=tk.EW)
-        ttk.Button(adjust_frame, text="-1 min", command=lambda: self.adjust_time(-6000)).grid(row=0, column=2, padx=2, sticky=tk.EW)
-        ttk.Button(adjust_frame, text="-5 min", command=lambda: self.adjust_time(-30000)).grid(row=0, column=3, padx=2, sticky=tk.EW)
-
-        # Information frame
-        info_frame = ttk.LabelFrame(main_frame, text="Informacje", padding="5") # Zmniejszone padding 
-        info_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5) # Zmniejszone pady (z 10 na 5) 
-
-        # Start time label
-        self.start_time_label = ttk.Label(info_frame, text="Czas startu: --")
-        self.start_time_label.grid(row=0, column=0, sticky=tk.W, pady=1) # Zmniejszone pady (z 2 na 1) 
-
-        # Progress frame
-        progress_frame = ttk.Frame(info_frame)
-        progress_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=2) # Zmniejszone pady (z 5 na 2) 
-        progress_frame.columnconfigure(0, weight=1)
-
-        # Progress label and bar
-        self.progress_label = ttk.Label(progress_frame, text="Postęp dnia")
-        self.progress_label.grid(row=0, column=0, sticky=tk.W)
-
-        self.progress_bar = ttk.Progressbar(
-            progress_frame, 
-            orient="horizontal", 
-            mode="determinate"
-        )
-        self.progress_bar.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=1) # Zmniejszone pady (z 2 na 1) 
-
-        self.sum_label = ttk.Label(info_frame, text="Suma: 0 min (0.00%)", font=("Helvetica", 10, "bold")) # Zmniejszony rozmiar czcionki (z 12 na 10) 
-        self.sum_label.grid(row=2, column=0, sticky=tk.W, pady=1) # Zmniejszone pady (z 2 na 1) 
-
-        # Quick actions frame
-        quick_frame = ttk.LabelFrame(main_frame, text="Szybkie akcje", padding="5") # Zmniejszone padding 
-        quick_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=5) # Zmniejszone pady (z 10 na 5) 
-        quick_frame.columnconfigure((0, 1), weight=1)
-
-        ttk.Button(quick_frame, text="Historia", command=self.show_history).grid(row=0, column=0, padx=5, sticky=tk.EW)
-        ttk.Button(quick_frame, text="Statystyki", command=self.show_statistics).grid(row=0, column=1, padx=5, sticky=tk.EW)
-
-        # Create status indicator
-        self.create_status_indicator()
-
-    def adjust_time(self, centiseconds: int) -> None:
-        """Adjust time by specified centiseconds."""
-        self.counter = max(0, self.counter + centiseconds)
-        self.refresh_time_label()
-        self.logger.info(f"Time adjusted by {centiseconds/6000:.1f} minutes")
-
     def setup_keybindings(self) -> None:
-        """Setup comprehensive keyboard shortcuts."""
         bindings = {
             '<Control-s>': lambda e: self.start(),
             '<Control-p>': lambda e: self.stop(),
@@ -376,599 +260,563 @@ class StopwatchApp:
             '<space>': lambda e: self.toggle_start_stop(),
             '<Escape>': lambda e: self.reset()
         }
-        
         for key, command in bindings.items():
             self.root.bind_all(key, command)
 
-    def toggle_start_stop(self) -> None:
-        """Toggle between start and stop."""
-        if self.is_running:
-            self.stop()
-        else:
-            self.start()
-
-    def create_status_indicator(self) -> None:
-        """Create modern status indicator."""
-        self.status_popup = tk.Toplevel(self.root)
-        self.status_popup.overrideredirect(True)
-        self.status_popup.attributes("-topmost", True)
-        self.status_popup.attributes("-alpha", 0.9)
-
-        # Position in bottom-right corner with smaller size
-        size = 21 # Zmniejszony rozmiar (z 21 na 17) 
-        offset_x = 15 # Zmniejszony offset
-        offset_y = 40 # Zmniejszony offset
-        x = self.root.winfo_screenwidth() - size - offset_x
-        y = self.root.winfo_screenheight() - size - offset_y
-        self.status_popup.geometry(f"{size}x{size}+{x}+{y}")
-
-        # Status frame
-        self.status_frame = tk.Frame(self.status_popup, relief=tk.RAISED, bd=1)
-        self.status_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Only minutes display (no symbol needed in such small space)
-        self.status_time_label = tk.Label(
-            self.status_frame,
-            text="0",
-            fg="white",
-            font=("Helvetica", 8, "bold") 
-        )
-        self.status_time_label.pack(expand=True)
-
-    def update_display(self) -> None:
-        """Main display update loop with better performance."""
-        if self.is_running:
-            self.counter += 1
-            
-        # Update displays
-        self.refresh_time_label()
-        self.update_time_color()
-        self.update_status_indicator()
-        
-        # Update progress less frequently
-        if self.counter % 600 == 0:  # Every 6 seconds
-            self.update_progress()
-        
-        # Schedule next update
-        self.root.after(10, self.update_display)
-
-    def update_status_indicator(self) -> None:
-        """Update status indicator."""
-        if hasattr(self, 'status_frame') and hasattr(self, 'status_time_label'):
-            minutes = self.counter // 6000
-            
-            # Change background color based on running state
-            if self.is_running:
-                bg_color = "#4CAF50"  # Green when running
-            else:
-                bg_color = "#F44336"  # Red when stopped
-            
-            self.status_frame.config(bg=bg_color)
-            self.status_time_label.config(bg=bg_color, text=str(minutes))
-
-    def update_progress(self) -> None:
-        """Update progress information."""
-        total_minutes = self.read_and_sum_today()
-        current_minutes = self.counter // 6000
-        total_with_current = total_minutes + current_minutes
-        
-        percentage = (total_with_current / self.daily_goal) * 100
-        
-        # Update progress bar
-        self.progress_bar["value"] = min(percentage, 100)
-        
-        # Update color based on progress
-        # color = self.get_color_by_percentage(percentage / 100)
-        current_bar_color = self.update_progress_color()
-        
-        # Update labels
-        self.sum_label.config(
-            text=f"Suma: {total_with_current} min ({percentage:.1f}% celu: {self.daily_goal} min)",
-            foreground=current_bar_color
-        )
-
-    def get_color_by_percentage(self, pct: float) -> str:
-        """Get color based on progress percentage with smooth transitions."""
-        if pct < 0.25:
-            return "#FF4444"  # Red
-        elif pct < 0.5:
-            return "#FF8800"  # Orange  
-        elif pct < 0.75:
-            return "#FFDD00"  # Yellow
-        elif pct < 1.0:
-            return "#88DD00"  # Light green
-        else:
-            return "#00AA00"  # Green
-
-    def update_progress_color(self) -> str:
-        """Aktualizuje kolor paska postępu."""
-        total_minutes = self.read_and_sum_today()
-        current_minutes = self.counter // 6000
-        total_with_current = total_minutes + current_minutes
-        percentage = (total_with_current / self.daily_goal) * 100
-        
-        # Konfiguruj styl paska postępu
-        style = ttk.Style()
-        
-        if percentage < 25:
-            color = "#E74C3C"  # Czerwony
-        elif percentage < 50:
-            color = "#F39C12"  # Pomarańczowy
-        elif percentage < 75:
-            #color = "#F1C40F"  # Żółty
-            # color = "#008080"  # Ciemny turkus
-            color = "#800080"  # Ciemny fiolet
-        elif percentage < 100:
-            color = "#2ECC71"  # Jasnozielony
-        else:
-            color = "#27AE60"  # Ciemnozielony
-        
-        style.configure("Custom.Horizontal.TProgressbar", 
-            troughcolor='#ECF0F1', 
-            background=color)
-        
-        self.progress_bar.configure(style="Custom.Horizontal.TProgressbar")
-        
-        return color
-
-    def refresh_time_label(self) -> None:
-        """Refresh time display with better formatting."""
-        formatted_time = self.format_time(self.counter)
-        self.time_label.config(text=formatted_time)
-        
-        # Update window title with current time
-        minutes = self.counter // 6000
-        status = "▶" if self.is_running else "⏸"
-        self.root.title(f"Stoper Pro - {status} {minutes}m")
-            
-    def format_time(self, count: int) -> str:
-        """Format time in HH:MM:SS format always."""
-        total_seconds = count // 100
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        seconds = total_seconds % 60
-        
-        # Zawsze wyświetlaj w formacie HH:MM:SS
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
+    # ==========================================================================
+    #  Główna Logika Stoper (Core Logic)
+    # ==========================================================================
+    
     def start(self) -> None:
-        """Start the stopwatch with improved state management."""
-        if not self.is_running:
-            # Zapisz opis zadania
-            self.current_task = self.task_var.get().strip()
-            
-            self.is_running = True
-            if self.start_time is None:
-                self.start_time = datetime.now()
-                self.refresh_start_time_label()
-            
-            self.logger.info(f"Stopwatch started - Task: {self.current_task}")
-            self.start_button.config(text="Uruchomiony", state="disabled")
-            self.pause_button.config(state="normal")
-            
-            # Zablokuj pole zadania podczas działania stopera
-            self.task_entry.config(state="disabled")
-        
-            # Hide reminder if visible
-            self.hide_reminder()
+        if self.is_running: return
+        self.is_running = True
+        self.current_task = self.task_var.get().strip()
+        if self.start_timestamp is None:
+            self.start_timestamp = datetime.now()
+        else: # Wznowienie po pauzie
+            self.start_timestamp = datetime.now()
+
+        self.logger.info(f"Stoper wystartował/wznowiony - Zadanie: {self.current_task or 'Brak'}")
+        self.refresh_start_time_label()
+        self.update_ui_state()
+        self.hide_reminder()
 
     def stop(self) -> None:
-        """Stop/pause the stopwatch."""
-        if self.is_running:
-            self.is_running = False
-            self.logger.info("Stopwatch paused")
-            self.start_button.config(text="Wznów", state="normal")
-            self.pause_button.config(state="disabled")
-            
-            # Odblokuj pole zadania
-            self.task_entry.config(state="normal")
+        if not self.is_running: return
+        self.is_running = False
+        if self.start_timestamp:
+            elapsed = (datetime.now() - self.start_timestamp).total_seconds()
+            self.elapsed_time_before_pause += elapsed
+            self.counter = self.elapsed_time_before_pause
+        self.logger.info("Stoper zatrzymany (pauza)")
+        self.update_ui_state()
 
     def reset(self) -> None:
-        """Reset stopwatch with confirmation for long sessions."""
-        if self.counter > 60000:  # More than 10 minutes
+        if self.counter > AppConfig.RESET_CONFIRMATION_SECONDS:
             if not messagebox.askyesno("Potwierdzenie", 
-                f"Czy na pewno chcesz zresetować {self.counter//6000} minut?"):
+                        f"Czy na pewno chcesz zresetować {int(self.counter // 60)} minut?"):
                 return
-        
         self.is_running = False
-        self.counter = 0
-        self.start_time = None
+        self.counter = 0.0
+        self.start_timestamp = None
+        self.elapsed_time_before_pause = 0.0
         self.current_task = ""
         self.task_var.set("")
-        
+        self.last_logged_minute_mark = 0
         self.refresh_time_label()
         self.refresh_start_time_label()
         self.update_progress()
-        
-        self.start_button.config(text="Start", state="normal")
-        self.pause_button.config(state="normal")
-        self.task_entry.config(state="normal")
-        
-        self.logger.info("Stopwatch reset")
+        self.update_ui_state()
+        self.logger.info("Stoper zresetowany")
 
-    def refresh_start_time_label(self) -> None:
-        """Refresh start time display."""
-        if self.start_time is None:
-            self.start_time_label.config(
-                text="Czas startu: --",
-                foreground="#7F8C8D"  # Szary dla braku danych
-            )
+    def toggle_start_stop(self) -> None:
+        if self.is_running: self.stop()
+        else: self.start()
+
+    def adjust_time(self, seconds: int) -> None:
+        self.counter = max(0, self.counter + seconds)
+        self.elapsed_time_before_pause = max(0, self.elapsed_time_before_pause + seconds)
+        self.refresh_time_label()
+        self.logger.info(f"Czas skorygowany o {seconds/60:.1f} minut")
+        
+    # ==========================================================================
+    #  Aktualizacja Interfejsu (UI Updates)
+    # ==========================================================================
+
+    def update_display(self) -> None:
+        if self.is_running and self.start_timestamp:
+            elapsed = (datetime.now() - self.start_timestamp).total_seconds()
+            self.counter = self.elapsed_time_before_pause + elapsed
+
+            # Logowanie co 5 minut
+            current_five_minute_interval = int(self.counter) // 300
+            if current_five_minute_interval > self.last_logged_minute_mark:
+                self.last_logged_minute_mark = current_five_minute_interval
+                formatted_time = self.format_time(self.counter)
+                self.logger.info(f"Stoper aktywny. Czas: {formatted_time}")
+
+        self.refresh_time_label()
+        self.update_time_color()
+        self.update_status_indicator()
+        if int(self.counter) % 5 == 0: self.update_progress()
+        self.root.after(200, self.update_display)
+
+    def update_ui_state(self):
+        if self.is_running:
+            self.start_button.config(text="Uruchomiony", state="disabled")
+            self.pause_button.config(state="normal")
+            self.task_entry.config(state="disabled")
         else:
-            formatted = self.start_time.strftime("%H:%M:%S")
-            duration = datetime.now() - self.start_time
-            
-            if hasattr(self, 'start_time_label'):
-                self.start_time_label.config(
-                    text=f"Start: {formatted} (przed {self.format_duration(duration)})",
-                    foreground="#8E44AD"  # Fioletowy dla aktywnego czasu
-                )
+            start_text = "Wznów" if self.counter > 0 else "Start"
+            self.start_button.config(text=start_text, state="normal")
+            self.pause_button.config(state="disabled")
+            self.task_entry.config(state="normal")
+
+    def format_time(self, total_seconds: float) -> str:
+        total_seconds = int(total_seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def format_duration(self, duration: timedelta) -> str:
-        """Format duration in human-readable format."""
-        total_seconds = int(duration.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        
-        if hours > 0:
-            return f"{hours}h {minutes}m"
-        else:
-            return f"{minutes}m"
+        s = int(duration.total_seconds())
+        h, rem = divmod(s, 3600)
+        m, _ = divmod(rem, 60)
+        return f"{h}h {m}m" if h > 0 else f"{m}m"
 
-    def show_statistics(self) -> None:
-        """Show comprehensive statistics window."""
-        stats_window = tk.Toplevel(self.root)
-        stats_window.title("Statystyki")
-        # Zmniejszona wysokość okna statystyk (z 500 na 400)
-        stats_window.geometry("700x400")
-        stats_window.transient(self.root)
-        
-        # Create notebook for different stats views
-        notebook = ttk.Notebook(stats_window)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Weekly stats
-        weekly_frame = ttk.Frame(notebook)
-        notebook.add(weekly_frame, text="Tydzień")
-        self.create_weekly_stats(weekly_frame)
-        
-        # Monthly stats  
-        monthly_frame = ttk.Frame(notebook)
-        notebook.add(monthly_frame, text="Miesiąc")
-        self.create_monthly_stats(monthly_frame)
-        
-        # Trends
-        trends_frame = ttk.Frame(notebook)
-        notebook.add(trends_frame, text="Trendy")
-        self.create_trends_stats(trends_frame)
+    def refresh_time_label(self) -> None:
+        formatted_time = self.format_time(self.counter)
+        self.time_label.config(text=formatted_time)
+        minutes = int(self.counter // 60)
+        status = "▶" if self.is_running else "⏸"
+        self.root.title(f"{AppConfig.APP_NAME} - {status} {minutes}m")
 
-    def create_weekly_stats(self, parent: ttk.Frame) -> None:
-        """Create weekly statistics view."""
-        label = ttk.Label(parent, text="Statystyki tygodniowe będą dostępne w następnej wersji")
-        label.pack(pady=20)
-
-    def create_monthly_stats(self, parent: ttk.Frame) -> None:
-        """Create monthly statistics view."""
-        label = ttk.Label(parent, text="Statystyki miesięczne będą dostępne w następnej wersji")
-        label.pack(pady=20)
-
-    def create_trends_stats(self, parent: ttk.Frame) -> None:
-        """Create trends statistics view."""
-        label = ttk.Label(parent, text="Analiza trendów będzie dostępna w następnej wersji")
-        label.pack(pady=20)
-
-    def show_shortcuts(self) -> None:
-        """Show keyboard shortcuts dialog."""
-        shortcuts = """
-Skróty klawiszowe:
-
-Ctrl+S          - Start stopera
-Ctrl+P          - Pauza
-Ctrl+R          - Reset
-Ctrl+Enter      - Zapisz do logu
-Ctrl+H          - Historia
-Ctrl+,          - Konfiguracja
-Ctrl+T          - Statystyki
-F1              - Ta pomoc
-Spacja          - Start/Pauza
-Escape          - Reset
-        """
-        messagebox.showinfo("Skróty klawiszowe", shortcuts)
-
-    def show_about(self) -> None:
-        """Show about dialog."""
-        about_text = """
-Stoper Pro v2.0
-
-Zaawansowana aplikacja do śledzenia czasu
-z funkcjami analizy i raportowania.
-Autor: Ulepszona wersja
-Data: 2025
-        """
-        messagebox.showinfo("O aplikacji", about_text)
-
-    def export_data(self) -> None:
-        """Export data to different formats."""
-        messagebox.showinfo("Eksport", "Funkcja eksportu będzie dostępna w następnej wersji")
-
-    def import_data(self) -> None:
-        """Import data from file."""
-        messagebox.showinfo("Import", "Funkcja importu będzie dostępna w następnej wersji")
-
-    def add_to_log(self) -> None:
-        """Enhanced log addition with validation and auto-save."""
-        minutes = self.counter // 6000
-        
-        # Don't save if less than 1 minute
-        if minutes < 1:
-            messagebox.showwarning("Uwaga", "Czas musi wynosić co najmniej 1 minutę aby zapisać.")
+    def refresh_start_time_label(self) -> None:
+        if self.elapsed_time_before_pause == 0 and not self.is_running:
+            self.start_time_label.config(text="Czas startu: --", foreground=AppConfig.COLOR_GRAY)
             return
-            
-        self.stop()
         
-        # Save to log
+        start_time_to_show = self.start_timestamp or datetime.now()
+        first_start_time = start_time_to_show - timedelta(seconds=self.elapsed_time_before_pause)
+        formatted = first_start_time.strftime("%Y-%m-%d %H:%M:%S")
+        duration = datetime.now() - first_start_time
+
+        self.start_time_label.config(text=f"Start: {formatted} (przed {self.format_duration(duration)})", foreground=AppConfig.COLOR_PURPLE_DARK)
+
+    def update_time_color(self) -> None:
+        if self.is_running: color = AppConfig.COLOR_GREEN_DARK
+        elif self.counter > 0: color = AppConfig.COLOR_ORANGE_DARK
+        else: color = AppConfig.COLOR_BLUE_SEA
+        self.time_label.config(fg=color)
+
+    def update_progress(self) -> None:
+        total_minutes = self.read_and_sum_today()
+        current_minutes = int(self.counter // 60)
+        total_with_current = total_minutes + current_minutes
+        percentage = (total_with_current / self.daily_goal) * 100 if self.daily_goal > 0 else 0
+
+        # Propozycja 3: Status słowny
+        if percentage < 25:
+            status = "(Początek)"
+        elif percentage < 75:
+            status = "(Dobra passa)"
+        elif percentage < 100:
+            status = "(Już prawie!)"
+        else:
+            status = "(Cel osiągnięty!)"
+
+        self.progress_bar["value"] = min(percentage, 100)
+        color = self.get_progress_color(percentage)
+        self.style.configure("Custom.Horizontal.TProgressbar", troughcolor=AppConfig.COLOR_FG_DARK, background=color)
+        self.progress_bar.configure(style="Custom.Horizontal.TProgressbar")
+        
+        # Aktualizacja etykiety "Postęp dnia" z emoji
+        self.progress_label.config(text=f"Postęp dnia {status}")
+        
+        self.sum_label.config(
+            text=f"Suma: {total_with_current} min ({percentage:.1f}% celu: {self.daily_goal} min)",
+            foreground=color
+        )
+
+    def get_progress_color(self, percentage: float) -> str:
+        if percentage < 25: return AppConfig.COLOR_RED_DARK
+        elif percentage < 50: return AppConfig.COLOR_ORANGE_LIGHT
+        elif percentage < 75: return AppConfig.COLOR_GREEN_LIGHT
+        else: return AppConfig.COLOR_GREEN_DARK
+
+    # ==========================================================================
+    #  Obsługa Plików i Danych (File Handling & Data)
+    # ==========================================================================
+    
+    def add_to_log(self) -> None:
+        minutes = int(self.counter // 60)
+        if minutes < 1:
+            messagebox.showwarning("Uwaga", "Czas musi wynosić co najmniej 1 minutę, aby go zapisać.")
+            return
+        if self.is_running: self.stop()
         if self.save_to_log(minutes):
             messagebox.showinfo("Sukces", f"Zapisano {minutes} minut do logu.")
-            
-            # Always reset after save
-            self.reset()
+            if self.config.get('auto_save', True): self.reset()
             self.update_progress()
         else:
             messagebox.showerror("Błąd", "Nie udało się zapisać do logu.")
 
     def save_to_log(self, minutes: int) -> bool:
-        """Save time entry to log file with improved error handling."""
-        log_path = self.get_app_path() / "wynik.txt"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        task_desc = self.current_task if self.current_task.strip() else "Bez opisu"  # POPRAWKA: użyj self.current_task
+        log_path = self.get_app_path() / AppConfig.LOG_FILE
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        task_desc = self.current_task if self.current_task else "Bez opisu"
         
+        file_exists = log_path.exists() and log_path.stat().st_size > 0
+
         try:
-            # Create backup if file exists
-            if log_path.exists() and log_path.stat().st_size > 1024:  # If file > 1KB
-                backup_path = log_path.with_suffix('.bak')
-                import shutil
+            if log_path.exists() and log_path.stat().st_size > 1024 * 1024: # Backup if > 1MB
+                backup_path = self.get_app_path() / AppConfig.LOG_BACKUP_FILE
                 shutil.copy2(log_path, backup_path)
             
-            # Append new entry
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp}\t{minutes}\t{task_desc}\n")
-            
-            self.logger.info(f"Saved {minutes} minutes to log - Task: {task_desc}")
+            with open(log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+                
+                if not file_exists:
+                    writer.writerow(["Data", "Minuty", "Zadanie"]) # Nagłówek
+                
+                writer.writerow([timestamp, minutes, task_desc])
+
+            self.logger.info(f"Zapisano {minutes} minut do logu CSV - Zadanie: {task_desc}")
             return True
-            
         except IOError as e:
-            self.logger.error(f"Failed to save to log: {e}")
+            self.logger.error(f"Błąd zapisu do logu CSV: {e}")
             return False
 
-    def read_and_sum_today(self) -> int:		
-        """Read and sum today's minutes with better error handling."""
-        log_path = self.get_app_path() / "wynik.txt"
-        
-        if not log_path.exists():
-            return 0
-        
-        total = 0
-        today = datetime.now().date()
-        
+    def read_and_sum_today(self) -> int:
+        log_path = self.get_app_path() / AppConfig.LOG_FILE
+        if not log_path.exists(): return 0
+        total, today = 0, datetime.now().date()
         try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
+            with open(log_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f, delimiter=';')
+                next(reader, None) # Pomiń nagłówek
+                
+                for line_num, row in enumerate(reader, 2):
+                    if not row: continue
+                    if len(row) < 3:
+                        self.logger.warning(f"Nieprawidłowa liczba kolumn w linii {line_num}: {row}")
                         continue
-                    
-                    parts = line.split("\t")
-                    if len(parts) < 2:  # ZMIENIONE z != 2 na < 2
-                        self.logger.warning(f"Invalid format in line {line_num}: {line}")
-                        continue
-                    
                     try:
-                        date_str = parts[0].split(" ")[0]
-                        entry_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        
+                        entry_date = datetime.strptime(row[0].split(" ")[0], "%Y-%m-%d").date()
                         if entry_date == today:
-                            total += int(parts[1])
+                            total += int(row[1])
                     except (ValueError, IndexError) as e:
-                        self.logger.warning(f"Error parsing line {line_num}: {e}")
-                        continue
+                        self.logger.warning(f"Błąd parsowania linii {line_num}: {e}")
         except IOError as e:
-            self.logger.error(f"Error reading log file: {e}")
+            self.logger.error(f"Błąd odczytu pliku logu CSV: {e}")
         return total
+        
+    def load_config(self) -> Dict:
+        config_path = self.get_app_path() / AppConfig.CONFIG_FILE
+        default_config = {
+            'daily_goal': 180, 'reminder_interval': 120, 'reminder_duration': 15000,
+            'auto_save': True, 'sound_enabled': False, 'window_always_on_top': False, 'theme': 'default'
+        }
+        if not config_path.exists():
+            self.save_config(default_config)
+            return default_config
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                return self.validate_config(config, default_config)
+        except (json.JSONDecodeError, IOError) as e:
+            self.logger.error(f"Błąd ładowania konfiguracji: {e}")
+            return default_config
 
+    def validate_config(self, config: Dict, default_config: Dict) -> Dict:
+        validated = default_config.copy()
+        for key, default_value in default_config.items():
+            if key in config:
+                value = config[key]
+                if key in ['daily_goal', 'reminder_interval', 'reminder_duration']:
+                    if isinstance(value, int) and value > 0: validated[key] = value
+                elif key in ['auto_save', 'sound_enabled', 'window_always_on_top']:
+                    validated[key] = bool(value)
+                elif key == 'theme' and isinstance(value, str):
+                    validated[key] = value
+        return validated
+
+    def save_config(self, config: Optional[Dict] = None) -> bool:
+        if config is None: config = self.config
+        config_path = self.get_app_path() / AppConfig.CONFIG_FILE
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            self.logger.info("Konfiguracja zapisana.")
+            return True
+        except IOError as e:
+            self.logger.error(f"Błąd zapisu konfiguracji: {e}")
+            messagebox.showerror("Błąd", f"Nie można zapisać konfiguracji: {e}")
+            return False
+
+    def apply_config_changes(self) -> None:
+        self.root.attributes("-topmost", self.config.get('window_always_on_top', False))
+        self.daily_goal = self.config.get('daily_goal', 180)
+        self.update_progress()
+
+    # ==========================================================================
+    #  Dodatkowe Okna i Funkcje (Extra Features & Windows)
+    # ==========================================================================
+
+    def show_statistics(self) -> None:
+        stats_window = tk.Toplevel(self.root)
+        stats_window.title("Statystyki Czasu Pracy")
+        stats_window.geometry("800x600")
+        stats_window.transient(self.root)
+        stats_window.grab_set()
+
+        start_date = date(2000, 1, 1)
+        end_date = datetime.now().date()
+        data = self.load_history_data(start_date, end_date)
+
+        if not data:
+            label = ttk.Label(stats_window, text="📊 Brak danych do wyświetlenia statystyk.", font=("Helvetica", 12))
+            label.pack(expand=True)
+            return
+
+        all_entries = []
+        for date_obj, entries in data.items():
+            for entry in entries:
+                all_entries.append({'date': date_obj, 'mins': entry[1], 'task': entry[2]})
+
+        total_minutes = sum(e['mins'] for e in all_entries)
+        total_hours = total_minutes / 60
+        total_entries = len(all_entries)
+        avg_session = total_minutes / total_entries if total_entries else 0
+        longest_session = max(e['mins'] for e in all_entries) if all_entries else 0
+
+        tasks_summary = {}
+        for entry in all_entries:
+            task_name = entry['task']
+            if task_name not in tasks_summary:
+                tasks_summary[task_name] = {'mins': 0, 'count': 0}
+            tasks_summary[task_name]['mins'] += entry['mins']
+            tasks_summary[task_name]['count'] += 1
+        sorted_tasks = sorted(tasks_summary.items(), key=lambda item: item[1]['mins'], reverse=True)
+
+        weekday_summary = {i: 0 for i in range(7)}
+        for entry in all_entries:
+            weekday = entry['date'].weekday()
+            weekday_summary[weekday] += entry['mins']
+        
+        daily_summary = {}
+        for date_obj, entries in data.items():
+            daily_summary[date_obj] = sum(e[1] for e in entries)
+        most_productive_day = max(daily_summary.items(), key=lambda item: item[1]) if daily_summary else (None, 0)
+        
+        notebook = ttk.Notebook(stats_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        summary_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(summary_frame, text="📈 Podsumowanie Ogólne")
+        
+        metrics_frame = ttk.LabelFrame(summary_frame, text="Główne Metryki", padding=10)
+        metrics_frame.pack(fill=tk.X, pady=5)
+        
+        metrics_text = (
+            f"🕒 Całkowity czas: {total_minutes} minut ({total_hours:.2f} godzin)\n"
+            f"📑 Łączna liczba wpisów: {total_entries}\n"
+            f"📊 Średnia długość sesji: {avg_session:.1f} minut\n"
+            f"⭐ Najdłuższa sesja: {longest_session} minut\n"
+            f"🏆 Najbardziej produktywny dzień: {most_productive_day[0]} ({most_productive_day[1]} min)" if most_productive_day[0] else ""
+        )
+        ttk.Label(metrics_frame, text=metrics_text, font=AppConfig.FONT_DEFAULT).pack(anchor=tk.W)
+
+        weekday_frame = ttk.LabelFrame(summary_frame, text="Podsumowanie Tygodniowe", padding=10)
+        weekday_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        weekday_tree = ttk.Treeview(weekday_frame, columns=('day', 'minutes'), show='headings')
+        weekday_tree.heading('day', text='Dzień Tygodnia')
+        weekday_tree.heading('minutes', text='Suma Minut')
+        weekday_tree.column('minutes', anchor=tk.E)
+        
+        polish_days = ['Poniedziałek', 'Wtorek', 'Środa', 'Czwartek', 'Piątek', 'Sobota', 'Niedziela']
+        for i, day_name in enumerate(polish_days):
+            mins = weekday_summary.get(i, 0)
+            if mins > 0:
+                weekday_tree.insert('', tk.END, values=(day_name, f"{mins} min"))
+        weekday_tree.pack(fill=tk.BOTH, expand=True)
+
+        tasks_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(tasks_frame, text="📋 Analiza Zadań")
+
+        task_tree = ttk.Treeview(tasks_frame, columns=('task', 'minutes', 'entries'), show='headings')
+        task_tree.heading('task', text='Zadanie')
+        task_tree.heading('minutes', text='Łączny Czas (min)')
+        task_tree.heading('entries', text='Ilość Wpisów')
+        task_tree.column('minutes', anchor=tk.E, width=150)
+        task_tree.column('entries', anchor=tk.E, width=100)
+        task_tree.column('task', width=400)
+
+        for task, details in sorted_tasks:
+            task_tree.insert('', tk.END, values=(task, details['mins'], details['count']))
+
+        task_scrollbar = ttk.Scrollbar(tasks_frame, orient=tk.VERTICAL, command=task_tree.yview)
+        task_tree.configure(yscrollcommand=task_scrollbar.set)
+        
+        task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        task_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def show_shortcuts(self) -> None:
+        shortcuts = """Skróty klawiszowe:
+
+Ctrl+S          - Start stopera
+Ctrl+P          - Pauza
+Ctrl+R          - Reset
+Ctrl+Enter      - Zapisz do logu
+Ctrl+H          - Pokaż historię
+Ctrl+,          - Otwórz konfigurację
+Ctrl+T          - Pokaż statystyki
+Spacja          - Start/Pauza (przełącz)
+Escape          - Reset
+F1              - Pokaż tę pomoc"""
+        messagebox.showinfo("Skróty klawiszowe", shortcuts)
+
+    def show_about(self) -> None:
+        about_text = f"""{AppConfig.APP_NAME} v{AppConfig.APP_VERSION}
+
+Zaawansowana aplikacja do śledzenia czasu
+z funkcjami analizy i raportowania.
+Autor: JarDobPL + AI
+Data: 2025"""
+        messagebox.showinfo(f"O aplikacji {AppConfig.APP_NAME}", about_text)
+
+    def export_data(self) -> None:
+        messagebox.showinfo("Eksport", "Funkcja eksportu będzie dostępna w następnej wersji.")
+
+    def import_data(self) -> None:
+        messagebox.showinfo("Import", "Funkcja importu będzie dostępna w następnej wersji.")
+    
+    # --- System przypomnień ---
     def reminder_check(self) -> None:
-        """Enhanced reminder system with smart timing."""
         if not self.is_running:
             now = datetime.now().timestamp()
             interval = self.config.get('reminder_interval', 120)
-            # Only show reminder if enough time has passed and we're not already showing one
-            if (self.last_reminder_time is None or now - self.last_reminder_time >= interval) and \
-            (self.reminder_window is None or not self.reminder_window.winfo_exists()):
+            is_reminder_visible = self.reminder_window and self.reminder_window.winfo_exists()
+            if (self.last_reminder_time is None or now - self.last_reminder_time >= interval) and not is_reminder_visible:
                 self.last_reminder_time = now
                 self.show_reminder()
-        # Check every 30 seconds instead of every second
         self.root.after(30000, self.reminder_check)
 
     def show_reminder(self) -> None:
-        """Show modern reminder notification."""
-        self.hide_reminder() # Hide any existing reminder
+        self.hide_reminder()
         self.reminder_window = tk.Toplevel(self.root)
-        self.reminder_window.overrideredirect(True)
-        self.reminder_window.attributes("-topmost", True)
-        self.reminder_window.attributes("-alpha", 0.95)
+        rw = self.reminder_window
+        rw.overrideredirect(True)
+        rw.attributes("-topmost", True)
+        rw.attributes("-alpha", 0.9)
 
-        # Position at top-right corner with reduced size
-        width, height = 240, 64 # Zmniejszone rozmiary (z 300x80 na 240x64) 
-        x = self.root.winfo_screenwidth() - width - 15 # Zmniejszony offset
-        y = self.root.winfo_screenheight() - height - 30 # Zmniejszony offset
-        self.reminder_window.geometry(f"{width}x{height}+{x}+{y}")
+        # ZMIANA: Geometria i pozycja paska przypomnienia
+        width = self.root.winfo_screenwidth()  # Szerokość na cały ekran
+        height = 35  # Niewielka wysokość paska
+        x = 0  # Pozycja X od lewej krawędzi
+        taskbar_height = 40  # Założona wysokość paska zadań Windows
+        y = self.root.winfo_screenheight() - height - taskbar_height  # Pozycja Y nad paskiem
 
-        # Create modern looking notification
-        main_frame = tk.Frame(self.reminder_window, bg='#2C3E50', relief=tk.RAISED, bd=2)
+        rw.geometry(f"{width}x{height}+{x}+{y}")
+
+        # ZMIANA: Tło ramki ustawione na kolor czerwony
+        main_frame = tk.Frame(rw, bg=AppConfig.COLOR_RED_DARK)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Title
-        title_label = tk.Label(
-            main_frame, 
-            text="⏱ Przypomnienie", 
-            font=("Helvetica", 10, "bold"), # Zmniejszony rozmiar czcionki (z 12 na 10) 
-            bg='#2C3E50', 
-            fg='white'
-        )
-        title_label.pack(pady=3) # Zmniejszone pady 
+        # ZMIANA: Tekst z emoji klepsydry i dopasowanie kolorów
+        reminder_text = "🚀"
+        reminder_text = reminder_text * 59
+        label = tk.Label(main_frame, text=reminder_text, font=("Helvetica", 11, "bold"), 
+                         bg=AppConfig.COLOR_RED_DARK, fg=AppConfig.COLOR_WHITE)
+        label.pack(pady=5, expand=True)
 
-        # Message
-        msg_label = tk.Label(
-            main_frame, 
-            text="Uruchom stoper aby kontynuować pracę!", 
-            font=("Helvetica", 8), # Zmniejszony rozmiar czcionki (z 10 na 8) 
-            bg='#2C3E50', 
-            fg='#ECF0F1'
-        )
-        msg_label.pack()
+        # ZMIANA: Możliwość zamknięcia okna poprzez kliknięcie na nim
+        main_frame.bind("<Button-1>", lambda e: self.hide_reminder())
+        label.bind("<Button-1>", lambda e: self.hide_reminder())
 
-        # Close button
-        close_btn = tk.Button(
-            main_frame, 
-            text="×", 
-            command=self.hide_reminder, 
-            bg='#E74C3C', 
-            fg='white', 
-            font=("Helvetica", 10, "bold"), # Zmniejszony rozmiar czcionki (z 12 na 10) 
-            relief=tk.FLAT, 
-            width=2 # Zmniejszona szerokość
-        )
-        close_btn.place(x=width-25, y=3) # Dostosowana pozycja przycisku
-
-        # Auto-hide after duration
-        duration = self.config.get('reminder_duration', 15000)
-        self.root.after(duration, self.hide_reminder)
+        self.root.after(self.config.get('reminder_duration', 15000), self.hide_reminder)
 
     def hide_reminder(self) -> None:
-        """Hide reminder window."""
         if self.reminder_window and self.reminder_window.winfo_exists():
             self.reminder_window.destroy()
             self.reminder_window = None
 
+    # --- Wskaźnik statusu ---
+    def create_status_indicator(self) -> None:
+        self.status_popup = tk.Toplevel(self.root)
+        sp = self.status_popup
+        sp.overrideredirect(True)
+        sp.attributes("-topmost", True)
+        sp.attributes("-alpha", 0.9)
+        size, offset_x, offset_y = 21, 15, 40
+        x = self.root.winfo_screenwidth() - size - offset_x
+        y = self.root.winfo_screenheight() - size - offset_y
+        sp.geometry(f"{size}x{size}+{x}+{y}")
+        self.status_frame = tk.Frame(sp, relief=tk.RAISED, bd=1)
+        self.status_frame.pack(fill=tk.BOTH, expand=True)
+        self.status_time_label = tk.Label(self.status_frame, text="0", fg="white", font=AppConfig.FONT_STATUS_INDICATOR)
+        self.status_time_label.pack(expand=True)
+
+    def update_status_indicator(self) -> None:
+        if self.status_popup and self.status_popup.winfo_exists():
+            minutes = int(self.counter // 60)
+            bg_color = AppConfig.COLOR_GREEN_DARK if self.is_running else AppConfig.COLOR_RED_DARK
+            self.status_frame.config(bg=bg_color)
+            self.status_time_label.config(bg=bg_color, text=str(minutes))
+
+    # --- Okno konfiguracji ---
     def show_config(self) -> None:
-        """Show enhanced configuration dialog."""
         config_window = tk.Toplevel(self.root)
         config_window.title("Konfiguracja")
-        config_window.geometry("500x320") # Zmniejszona wysokość okna konfiguracji (z 400 na 320) 
+        config_window.geometry("500x320")
         config_window.transient(self.root)
         config_window.grab_set()
 
-        # Create notebook for different config sections
         notebook = ttk.Notebook(config_window)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5) # Zmniejszone pady 
+        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        vars_dict = self._create_config_vars()
+        self._create_general_config(notebook, vars_dict)
+        self._create_reminder_config(notebook, vars_dict)
+        self._create_appearance_config(notebook, vars_dict)
 
-        # General settings
-        general_frame = ttk.Frame(notebook)
-        notebook.add(general_frame, text="Ogólne")
-        self.create_general_config(general_frame)
-
-        # Reminder settings
-        reminder_frame = ttk.Frame(notebook)
-        notebook.add(reminder_frame, text="Przypomnienia")
-        self.create_reminder_config(reminder_frame)
-
-        # Appearance settings
-        appearance_frame = ttk.Frame(notebook)
-        notebook.add(appearance_frame, text="Wygląd")
-        self.create_appearance_config(appearance_frame)
-
-        # Buttons frame
         button_frame = ttk.Frame(config_window)
-        button_frame.pack(fill=tk.X, padx=5, pady=5) # Zmniejszone pady 
-        ttk.Button(
-            button_frame, 
-            text="Zapisz", 
-            command=lambda: self.save_config_dialog(config_window)
-        ).pack(side=tk.RIGHT, padx=3) # Zmniejszone padx 
-        ttk.Button(
-            button_frame, 
-            text="Anuluj", 
-            command=config_window.destroy
-        ).pack(side=tk.RIGHT)
+        button_frame.pack(fill=tk.X, padx=5, pady=5, side=tk.BOTTOM)
+        ttk.Button(button_frame, text="Anuluj", command=config_window.destroy).pack(side=tk.RIGHT)
+        ttk.Button(button_frame, text="Zapisz", command=lambda: self._save_config_from_dialog(config_window, vars_dict)).pack(side=tk.RIGHT, padx=5)
 
-    def create_general_config(self, parent: ttk.Frame) -> None:
-        """Create general configuration section."""
-        # Daily goal
-        ttk.Label(parent, text="Cel dzienny (minuty):").grid(row=0, column=0, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-        self.goal_var = tk.StringVar(value=str(self.daily_goal))
-        goal_spinbox = ttk.Spinbox(parent, from_=30, to=1440, textvariable=self.goal_var, width=8) # Zmniejszona szerokość 
-        goal_spinbox.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
+    def _create_config_vars(self) -> Dict:
+        return {
+            'goal': tk.StringVar(value=str(self.config.get('daily_goal', 180))),
+            'auto_save': tk.BooleanVar(value=self.config.get('auto_save', True)),
+            'on_top': tk.BooleanVar(value=self.config.get('window_always_on_top', False)),
+            'rem_interval': tk.StringVar(value=str(self.config.get('reminder_interval', 120))),
+            'rem_duration': tk.StringVar(value=str(self.config.get('reminder_duration', 15000))),
+            'sound': tk.BooleanVar(value=self.config.get('sound_enabled', False)),
+            'theme': tk.StringVar(value=self.config.get('theme', 'default'))
+        }
 
-        # Auto-save option
-        self.auto_save_var = tk.BooleanVar(value=self.config.get('auto_save', True))
-        ttk.Checkbutton(
-            parent, 
-            text="Automatyczny reset po zapisie", 
-            variable=self.auto_save_var
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
+    def _create_general_config(self, parent: ttk.Notebook, vars_dict: Dict) -> None:
+        frame = ttk.Frame(parent, padding=10)
+        parent.add(frame, text="Ogólne")
+        ttk.Label(frame, text="Cel dzienny (minuty):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Spinbox(frame, from_=30, to=1440, textvariable=vars_dict['goal'], width=10).grid(row=0, column=1, sticky=tk.W)
+        ttk.Checkbutton(frame, text="Automatyczny reset po zapisie", variable=vars_dict['auto_save']).grid(row=1, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Checkbutton(frame, text="Okno zawsze na wierzchu", variable=vars_dict['on_top']).grid(row=2, columnspan=2, sticky=tk.W)
 
-        # Always on top option
-        self.always_on_top_var = tk.BooleanVar(value=self.config.get('window_always_on_top', False))
-        ttk.Checkbutton(
-            parent, 
-            text="Okno zawsze na wierzchu", 
-            variable=self.always_on_top_var
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
+    def _create_reminder_config(self, parent: ttk.Notebook, vars_dict: Dict) -> None:
+        frame = ttk.Frame(parent, padding=10)
+        parent.add(frame, text="Przypomnienia")
+        ttk.Label(frame, text="Interwał przypomnień (sekundy):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Spinbox(frame, from_=30, to=3600, textvariable=vars_dict['rem_interval'], width=10).grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(frame, text="Czas wyświetlania (ms):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Spinbox(frame, from_=5000, to=60000, textvariable=vars_dict['rem_duration'], width=10).grid(row=1, column=1, sticky=tk.W)
+        ttk.Checkbutton(frame, text="Dźwięk przypomnień (niedostępne)", variable=vars_dict['sound'], state="disabled").grid(row=2, columnspan=2, sticky=tk.W, pady=5)
 
-    def create_reminder_config(self, parent: ttk.Frame) -> None:
-        """Create reminder configuration section."""
-        # Reminder interval
-        ttk.Label(parent, text="Interwał przypomnień (sekundy):").grid(row=0, column=0, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-        self.reminder_interval_var = tk.StringVar(value=str(self.config.get('reminder_interval', 120)))
-        interval_spinbox = ttk.Spinbox(parent, 
-                                        from_=30, 
-                                        to=3600, 
-                                        textvariable=self.reminder_interval_var, 
-                                        width=8) # Zmniejszona szerokość 
-        interval_spinbox.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
+    def _create_appearance_config(self, parent: ttk.Notebook, vars_dict: Dict) -> None:
+        frame = ttk.Frame(parent, padding=10)
+        parent.add(frame, text="Wygląd")
+        ttk.Label(frame, text="Motyw (niedostępne):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Combobox(frame, textvariable=vars_dict['theme'], values=['default', 'dark', 'light'], state='disabled', width=12).grid(row=0, column=1, sticky=tk.W)
 
-        # Reminder duration
-        ttk.Label(parent, text="Czas wyświetlania (ms):").grid(row=1, column=0, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-        self.reminder_duration_var = tk.StringVar(value=str(self.config.get('reminder_duration', 15000)))
-        duration_spinbox = ttk.Spinbox(parent, from_=5000, to=60000, textvariable=self.reminder_duration_var, width=8) # Zmniejszona szerokość 
-        duration_spinbox.grid(row=1, column=1, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-
-        # Sound enabled
-        self.sound_enabled_var = tk.BooleanVar(value=self.config.get('sound_enabled', False))
-        ttk.Checkbutton(
-            parent, 
-            text="Dźwięk przypomnień", 
-            variable=self.sound_enabled_var
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-
-    def create_appearance_config(self, parent: ttk.Frame) -> None:
-        """Create appearance configuration section."""
-        # Theme selection
-        ttk.Label(parent, text="Motyw:").grid(row=0, column=0, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-        self.theme_var = tk.StringVar(value=self.config.get('theme', 'default'))
-        theme_combo = ttk.Combobox(parent, textvariable=self.theme_var, values=['default', 'dark', 'light'], state='readonly', width=8) # Zmniejszona szerokość 
-        theme_combo.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5) # Zmniejszone pady 
-
-    def save_config_dialog(self, window: tk.Toplevel) -> None:
-        """Save configuration from dialog."""
+    def _save_config_from_dialog(self, window: tk.Toplevel, vars_dict: Dict) -> None:
         try:
-            new_goal = int(self.goal_var.get())
-            new_interval = int(self.reminder_interval_var.get())
-            new_duration = int(self.reminder_duration_var.get())
+            new_goal = int(vars_dict['goal'].get())
+            new_interval = int(vars_dict['rem_interval'].get())
+            new_duration = int(vars_dict['rem_duration'].get())
             if new_goal <= 0 or new_interval <= 0 or new_duration <= 0:
-                raise ValueError("Wszystkie wartości muszą być większe od zera")
+                raise ValueError("Wartości liczbowe muszą być dodatnie.")
 
-            # Update configuration
-            self.daily_goal = new_goal
             self.config.update({
                 'daily_goal': new_goal,
                 'reminder_interval': new_interval,
                 'reminder_duration': new_duration,
-                'auto_save': self.auto_save_var.get(),
-                'sound_enabled': self.sound_enabled_var.get(),
-                'window_always_on_top': self.always_on_top_var.get(),
-                'theme': self.theme_var.get()
+                'auto_save': vars_dict['auto_save'].get(),
+                'sound_enabled': vars_dict['sound'].get(),
+                'window_always_on_top': vars_dict['on_top'].get(),
+                'theme': vars_dict['theme'].get()
             })
-
-            # Apply settings
             self.apply_config_changes()
             if self.save_config():
                 window.destroy()
@@ -976,312 +824,173 @@ Data: 2025
         except ValueError as e:
             messagebox.showerror("Błąd", f"Nieprawidłowa wartość: {e}")
 
-    def apply_config_changes(self) -> None:
-        """Apply configuration changes to the application."""
-        # Apply always on top setting
-        self.root.attributes("-topmost", self.config.get('window_always_on_top', False))
-        # Update progress display
-        self.update_progress()
-
+    # --- Okno historii ---
     def show_history(self) -> None:
-        """Show enhanced history window with filtering and export options."""
         history_window = tk.Toplevel(self.root)
         history_window.title("Historia")
-        history_window.geometry("800x480") # Zmniejszona wysokość okna historii (z 600 na 480) 
+        history_window.geometry("800x480")
         history_window.transient(self.root)
+        history_window.grab_set()
 
-        # Control frame
         control_frame = ttk.Frame(history_window)
-        control_frame.pack(fill=tk.X, padx=5, pady=3) # Zmniejszone pady 
-
-        # Days filter
-        ttk.Label(control_frame, text="Liczba dni:").pack(side=tk.LEFT, padx=3) # Zmniejszone padx 
-        self.days_var = tk.StringVar(value="7")
-        days_spinbox = ttk.Spinbox(control_frame, from_=1, to=365, textvariable=self.days_var, width=6) # Zmniejszona szerokość 
-        days_spinbox.pack(side=tk.LEFT, padx=3) # Zmniejszone padx 
-
-        # Date range filter
-        ttk.Label(control_frame, text="Od:").pack(side=tk.LEFT, padx=(10, 3)) # Zmniejszone padx 
+        control_frame.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(control_frame, text="Od:").pack(side=tk.LEFT, padx=(10, 3))
         self.start_date_var = tk.StringVar(value=(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"))
-        start_date_entry = ttk.Entry(control_frame, textvariable=self.start_date_var, width=10) # Zmniejszona szerokość 
-        start_date_entry.pack(side=tk.LEFT, padx=3) # Zmniejszone padx 
-        ttk.Label(control_frame, text="Do:").pack(side=tk.LEFT, padx=3) # Zmniejszone padx 
+        start_date_entry = ttk.Entry(control_frame, textvariable=self.start_date_var, width=12)
+        start_date_entry.pack(side=tk.LEFT, padx=3)
+        ttk.Label(control_frame, text="Do:").pack(side=tk.LEFT, padx=3)
         self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-        end_date_entry = ttk.Entry(control_frame, textvariable=self.end_date_var, width=10) # Zmniejszona szerokość 
-        end_date_entry.pack(side=tk.LEFT, padx=3) # Zmniejszone padx 
+        end_date_entry = ttk.Entry(control_frame, textvariable=self.end_date_var, width=12)
+        end_date_entry.pack(side=tk.LEFT, padx=3)
 
-        # Buttons
-        ttk.Button(
-            control_frame, 
-            text="Odśwież", 
-            command=lambda: self.refresh_history(text_widget)
-        ).pack(side=tk.LEFT, padx=5) # Zmniejszone padx 
-        ttk.Button(
-            control_frame, 
-            text="Eksportuj", 
-            command=self.export_history
-        ).pack(side=tk.LEFT, padx=3) # Zmniejszone padx 
-
-        # Text display with scrollbar
         text_frame = ttk.Frame(history_window)
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5) # Zmniejszone pady 
-		
-        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 10))
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 10), relief=tk.FLAT)
+        
+        ttk.Button(control_frame, text="Odśwież", command=lambda: self.refresh_history(text_widget)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="Eksportuj do CSV", command=self.export_history).pack(side=tk.LEFT, padx=3)
+
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
         text_widget.configure(yscrollcommand=scrollbar.set)
-
         text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Initial display
         self.refresh_history(text_widget)
 
     def refresh_history(self, text_widget: tk.Text) -> None:
-        """Refresh history display with enhanced formatting and proper Polish characters."""
+        text_widget.config(state="normal")
         text_widget.delete(1.0, tk.END)
-        
-        # Konfiguracja tagów kolorów
-        text_widget.tag_config("header", foreground="#2C3E50", font=("Helvetica", 12, "bold"))
-        text_widget.tag_config("date_good", foreground="#27AE60", font=("Helvetica", 11, "bold"))
-        text_widget.tag_config("date_bad", foreground="#E74C3C", font=("Helvetica", 11, "bold"))
-        text_widget.tag_config("time_entry", foreground="#3498DB")
-        text_widget.tag_config("task_desc", foreground="#8E44AD", font=("Helvetica", 9, "italic"))
-        text_widget.tag_config("summary", foreground="#D35400", font=("Helvetica", 10, "bold"))
-        
+
+        text_widget.tag_config("header", foreground=AppConfig.COLOR_BG_DARK, font=("Helvetica", 12, "bold"))
+        text_widget.tag_config("date_good", foreground=AppConfig.COLOR_GREEN_DARK, font=("Helvetica", 11, "bold"))
+        text_widget.tag_config("date_bad", foreground=AppConfig.COLOR_RED_DARK, font=("Helvetica", 11, "bold"))
+        text_widget.tag_config("time_entry", foreground=AppConfig.COLOR_BLUE_ACTION)
+        text_widget.tag_config("task_desc", foreground=AppConfig.COLOR_PURPLE_DARK, font=("Helvetica", 9, "italic"))
+        text_widget.tag_config("summary_header", foreground=AppConfig.COLOR_BG_DARK, font=("Helvetica", 10, "bold"))
+        text_widget.tag_config("summary_text", foreground=AppConfig.COLOR_BG_DARK, font=AppConfig.FONT_DEFAULT)
+
         try:
-            days = int(self.days_var.get())
             start_date = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d").date()
             end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d").date()
         except ValueError:
-            text_widget.insert(tk.END, "Błąd: Nieprawidłowy format daty lub liczby dni.")
+            text_widget.insert(tk.END, "Błąd: Nieprawidłowy format daty (oczekiwany: RRRR-MM-DD).")
             return
-
-        # Load and process data
         data = self.load_history_data(start_date, end_date)
-        
         if not data:
             text_widget.insert(tk.END, "Brak danych w wybranym okresie.")
             return
 
-        # Display header
-        text_widget.insert(tk.END, f"HISTORIA PRACY - {start_date} do {end_date}\n")
-        text_widget.insert(tk.END, f"Cel dzienny: {self.daily_goal} minut\n")
-        text_widget.insert(tk.END, "=" * 80 + "\n\n")
-
-        # Display daily summaries
-        total_minutes = 0
-        total_days = 0
-        goal_achieved_days = 0
-
+        text_widget.insert(tk.END, f"HISTORIA PRACY OD {start_date} DO {end_date}\n", "header")
+        text_widget.insert(tk.END, f"Cel dzienny: {self.daily_goal} minut\n\n", "summary_text")
+        
+        total_minutes, goal_achieved_days = 0, 0
         for date_obj in sorted(data.keys(), reverse=True):
             day_entries = data[date_obj]
             day_total = sum(entry[1] for entry in day_entries)
             total_minutes += day_total
-            total_days += 1
-            
-            percentage = (day_total / self.daily_goal) * 100
-            status = "✅" if day_total >= self.daily_goal else "❌"
-            
-            if day_total >= self.daily_goal:
-                goal_achieved_days += 1
-
-            # UŻYWA poprawionej metody
+            is_goal_achieved = day_total >= self.daily_goal
+            if is_goal_achieved: goal_achieved_days += 1
+            status, tag = ("✅", "date_good") if is_goal_achieved else ("❌", "date_bad")
             day_name = self.get_polish_day_name(date_obj)
-            formatted_date = f"{day_name}, {date_obj.strftime('%d.%m.%Y')}"
-
-            text_widget.insert(tk.END, f"{formatted_date} {status}\n")
-            text_widget.insert(tk.END, f"  📊 Suma: {day_total:3d} min ({percentage:5.1f}% celu)\n")
-            
-            # Show individual entries with task description
-            for entry in day_entries:
-                timestamp = entry[0]
-                minutes = entry[1]
-                task_desc = entry[2] if len(entry) > 2 else "Bez opisu"
-                
-                time_part = timestamp.split(' ')[1] if ' ' in timestamp else timestamp
-                text_widget.insert(tk.END, f"    🕐 {time_part} - {minutes:3d} min - {task_desc}\n")
-
-        # Display summary statistics
+            text_widget.insert(tk.END, f"{day_name.capitalize()}, {date_obj.strftime('%Y-%m-%d')} {status}\n", tag)
+            text_widget.insert(tk.END, f"  Suma: {day_total} min\n", "summary_text")
+            for ts, mins, task in day_entries:
+                time_part = ts.split(' ')[1] if ' ' in ts else ''
+                text_widget.insert(tk.END, f"    {time_part} - ", "time_entry")
+                text_widget.insert(tk.END, f"{mins} min - ", "summary_text")
+                text_widget.insert(tk.END, f"{task}\n", "task_desc")
+            text_widget.insert(tk.END, "\n")
+        
+        total_days = len(data)
         if total_days > 0:
             avg_daily = total_minutes / total_days
             success_rate = (goal_achieved_days / total_days) * 100
-            
-            text_widget.insert(tk.END, "=" * 80 + "\n")
-            text_widget.insert(tk.END, "📈 PODSUMOWANIE STATYSTYCZNE\n")
-            text_widget.insert(tk.END, "=" * 80 + "\n")
-            text_widget.insert(tk.END, f"📅 Okres: {total_days} dni\n")
-            text_widget.insert(tk.END, f"⏱️  Łączny czas: {total_minutes} minut ({total_minutes/60:.1f} godzin)\n")
-            text_widget.insert(tk.END, f"📊 Średnia dzienna: {avg_daily:.1f} minut\n")
-            text_widget.insert(tk.END, f"🎯 Dni z osiągniętym celem: {goal_achieved_days}/{total_days} ({success_rate:.1f}%)\n")
-            
-            # Najlepszy dzień
-            best_date = max(data.keys(), key=lambda d: sum(e[1] for e in data[d]))
-            best_day_name = self.get_polish_day_name(best_date)
-            text_widget.insert(tk.END, f"📈 Najlepszy dzień: {best_day_name}, {best_date.strftime('%d.%m.%Y')} ")
-            text_widget.insert(tk.END, f"({max(sum(e[1] for e in entries) for entries in data.values())} min)\n")
-
-    # Dodatkowa metoda dla debugowania kodowania
-    def debug_encoding(self) -> None:
-        """Debug encoding issues."""
-        import sys
-        import locale
-        
-        self.logger.info(f"System encoding: {sys.getdefaultencoding()}")
-        self.logger.info(f"File system encoding: {sys.getfilesystemencoding()}")
-        self.logger.info(f"Locale: {locale.getlocale()}")
-        self.logger.info(f"Preferred encoding: {locale.getpreferredencoding()}")
-
-    # Alternatywne rozwiązanie - bezpośrednie mapowanie
-    POLISH_DAYS_MAPPING = {
-        'Monday': 'poniedziałek',
-        'Tuesday': 'wtorek',
-        'Wednesday': 'środa', 
-        'Thursday': 'czwartek',
-        'Friday': 'piątek',
-        'Saturday': 'sobota',
-        'Sunday': 'niedziela'
-    }
-
-    def get_polish_day_safe(self, date_obj: datetime.date) -> str:
-        """Safe method to get Polish day name."""
-        try:
-            # Najpierw spróbuj z locale
-            english_day = date_obj.strftime('%A')
-            if english_day in self.POLISH_DAYS_MAPPING:  # DODANE self.
-                return self.POLISH_DAYS_MAPPING[english_day]
-            
-            # Fallback na indeks dnia
-            polish_days = ['poniedziałek', 'wtorek', 'środa', 'czwartek', 'piątek', 'sobota', 'niedziela']
-            return polish_days[date_obj.weekday()]
-        except:
-            return f"dzień-{date_obj.weekday() + 1}"
+            text_widget.insert(tk.END, "="*80 + "\nPODSUMOWANIE OKRESU\n" + "="*80 + "\n", "summary_header")
+            text_widget.insert(tk.END, f"Łączny czas: {total_minutes} minut ({total_minutes/60:.2f} godzin)\n", "summary_text")
+            text_widget.insert(tk.END, f"Średnia dzienna: {avg_daily:.1f} minut\n", "summary_text")
+            text_widget.insert(tk.END, f"Dni z osiągniętym celem: {goal_achieved_days}/{total_days} ({success_rate:.1f}%)\n", "summary_text")
+        text_widget.config(state="disabled")
 
     def load_history_data(self, start_date: datetime.date, end_date: datetime.date) -> Dict:
-        """Load history data for specified date range."""
-        log_path = self.get_app_path() / "wynik.txt"
-        
-        if not log_path.exists():
-            return {}
-
-        data = {}
-        
+        log_path = self.get_app_path() / AppConfig.LOG_FILE
+        if not log_path.exists(): return {}
+        data: Dict[datetime.date, list] = {}
         try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
+            with open(log_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f, delimiter=';')
+                next(reader, None) # Pomiń nagłówek
+
+                for line_num, row in enumerate(reader, 2):
+                    if not row: continue
+                    if len(row) < 3:
+                        self.logger.warning(f"Błędny format w linii {line_num}: {row}")
                         continue
-                    
-                    parts = line.split("\t")
-                    if len(parts) < 2:
-                        self.logger.warning(f"Invalid format in line {line_num}: {line}")
-                        continue
-                    
                     try:
-                        timestamp = parts[0]
-                        minutes = int(parts[1])
-                        task_desc = parts[2] if len(parts) > 2 else "Bez opisu"
-                        date_obj = datetime.strptime(timestamp.split(" ")[0], "%Y-%m-%d").date()
-                        
+                        ts, mins_str, task = row[0], row[1], row[2]
+                        mins = int(mins_str)
+                        date_obj = datetime.strptime(ts.split(" ")[0], "%Y-%m-%d").date()
                         if start_date <= date_obj <= end_date:
-                            if date_obj not in data:
-                                data[date_obj] = []
-                            data[date_obj].append((timestamp, minutes, task_desc))
-                            
+                            if date_obj not in data: data[date_obj] = []
+                            data[date_obj].append((ts, mins, task))
                     except (ValueError, IndexError) as e:
-                        self.logger.warning(f"Error parsing line {line_num}: {e}")
-                        continue
-                        
+                        self.logger.warning(f"Błąd parsowania linii {line_num}: {e}")
         except IOError as e:
-            self.logger.error(f"Error reading history: {e}")
-            
+            self.logger.error(f"Błąd odczytu historii z CSV: {e}")
         return data
 
     def export_history(self) -> None:
-        """Export history to CSV format."""
         try:
-            from tkinter import filedialog
-            
+            start_date_str, end_date_str = self.start_date_var.get(), self.end_date_var.get()
             filename = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-                title="Eksportuj historię"
+                initialfile=f"historia_{start_date_str}_do_{end_date_str}.csv",
+                defaultextension=".csv", filetypes=[("Pliki CSV", "*.csv"), ("Wszystkie pliki", "*.*")],
+                title="Eksportuj historię do CSV"
             )
-            
-            if not filename:
-                return
-            
-            # Get date range
-            start_date = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d").date()
-            end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d").date()
-            
+            if not filename: return
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
             data = self.load_history_data(start_date, end_date)
-            
-            with open(filename, 'w', encoding='utf-8', newline='') as f:
-                f.write("Data,Czas,Minuty,Zadanie\n")
-                   
+            with open(filename, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f, delimiter=';')
+                writer.writerow(["Data", "Czas", "Minuty", "Zadanie"])
                 for date_obj in sorted(data.keys()):
-                    for entry in data[date_obj]:
-                        timestamp = entry[0]
-                        minutes = entry[1]
-                        task_desc = entry[2] if len(entry) > 2 else "Bez opisu"
-                        
-                        date_part = timestamp.split(' ')[0]
-                        time_part = timestamp.split(' ')[1] if ' ' in timestamp else ''
-                        
-                        task_desc_escaped = task_desc.replace('"', '""')
-                        f.write(f'{date_part},{time_part},{minutes},"{task_desc_escaped}"\n')
-            
-            messagebox.showinfo("Sukces", f"Historia została wyeksportowana do:\n{filename}")
-            
+                    for ts, mins, task in data[date_obj]:
+                        date_part, time_part = (ts.split(' ')[0], ts.split(' ')[1]) if ' ' in ts else (ts, '')
+                        writer.writerow([date_part, time_part, mins, task])
+            messagebox.showinfo("Sukces", f"Historia wyeksportowana do:\n{filename}")
         except Exception as e:
-            messagebox.showerror("Błąd", f"Błąd eksportu: {e}")
+            self.logger.error(f"Błąd eksportu: {e}")
+            messagebox.showerror("Błąd", f"Wystąpił błąd podczas eksportu: {e}")
+
+    # ==========================================================================
+    #  Obsługa Zamykania (Closing Handler)
+    # ==========================================================================
 
     def on_closing(self) -> None:
-        """Handle application closing with confirmation for running timer."""
-        if self.is_running:
-            if not messagebox.askyesno("Potwierdzenie", 
-                                      "Stoper jest uruchomiony. Czy na pewno chcesz zakończyć aplikację?"):
-                return
-        
-        # Save current state if needed
-        if self.counter > 0:
-            if messagebox.askyesno("Zapisać", 
-                                  f"Masz {self.counter//6000} minut na stoperze. Czy chcesz zapisać przed wyjściem?"):
+        if self.is_running and not messagebox.askyesno("Potwierdzenie", "Stoper jest uruchomiony.\nCzy na pewno chcesz zakończyć?"):
+            return
+        if self.counter > 60 and not self.config.get('auto_save', False):
+            if messagebox.askyesno("Zapisz", f"Masz {int(self.counter//60)} minut na stoperze.\nCzy zapisać przed wyjściem?"):
                 self.add_to_log()
         
-        # Clean up
-        if hasattr(self, 'status_popup') and self.status_popup.winfo_exists():
-            self.status_popup.destroy()
+        if self.status_popup and self.status_popup.winfo_exists(): self.status_popup.destroy()
+        self.hide_reminder()
         
-        if hasattr(self, 'reminder_window') and self.reminder_window and self.reminder_window.winfo_exists():
-            self.reminder_window.destroy()
-        
-        self.logger.info("Application closing")
+        self.logger.info("Aplikacja zamknięta.")
         self.root.destroy()
 
+# ==============================================================================
+#  Główny Punkt Wejścia (Main Entry Point)
+# ==============================================================================
 
 def main():
-    """Main application entry point."""
     try:
         root = tk.Tk()
-        
-        # Set application icon if available
-        try:
-            # Uncomment if you have an icon file
-            # root.iconbitmap('icon.ico')
-            pass
-        except:
-            pass
-        
+        # root.iconbitmap('path/to/icon.ico')
         app = StopwatchApp(root)
         root.mainloop()
-        
     except Exception as e:
-        print(f"Critical error: {e}")
-        import traceback
-        traceback.print_exc()
-
+        logging.critical(f"Krytyczny błąd aplikacji: {e}", exc_info=True)
+        messagebox.showerror("Błąd krytyczny", f"Wystąpił błąd krytyczny:\n{e}\n\nAplikacja zostanie zamknięta.")
 
 if __name__ == "__main__":
     main()
